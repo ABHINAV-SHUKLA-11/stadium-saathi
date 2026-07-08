@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  web:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - DASHBOARD_PASSWORD=stadium_saathi_admin_2026
+      - PORT=8080
+      - ENVIRONMENT=development
+    volumes:
+      # Mount DB to host for persistence
+      - ./stadium_saathi.db:/app/stadium_saathi.db
+    restart: always
