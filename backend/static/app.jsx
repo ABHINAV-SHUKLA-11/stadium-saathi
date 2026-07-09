@@ -84,7 +84,8 @@ function StadiumMap({ path = [], currentLocId = 'gate_a' }) {
                 <Icon name="map" className="text-blue" /> Stadium Map Preview
             </h3>
             <div className="map-container">
-                <svg viewBox="0 0 300 300" className="stadium-svg">
+                <svg viewBox="0 0 300 300" className="stadium-svg" role="img" aria-label="Interactive stadium map showing gates, sections, food stalls, washrooms, and first-aid locations">
+                    <title>Stadium Layout Map</title>
                     {/* Fictional Pitch Outer Rim */}
                     <rect x="90" y="90" width="120" height="120" rx="60" className="svg-stadium-ring" />
                     <rect x="110" y="110" width="80" height="80" rx="40" style={{ fill: 'none', stroke: 'rgba(255,255,255,0.03)', strokeWidth: 4 }} />
@@ -336,8 +337,9 @@ function FanChat({ sessionId, crowdData, currentLoc, setCurrentLoc }) {
                     <div className="input-box-wrapper">
                         {/* Current start location selector to simulate navigation inputs */}
                         <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
-                            <label style={{ fontSize: '0.65rem', color: 'var(--text-secondary)', marginBottom: '0.2rem' }}>Current Gate:</label>
+                            <label htmlFor="current-gate-select" style={{ fontSize: '0.65rem', color: 'var(--text-secondary)', marginBottom: '0.2rem' }}>Current Gate:</label>
                             <select 
+                                id="current-gate-select"
                                 value={currentLoc} 
                                 onChange={(e) => setCurrentLoc(e.target.value)}
                                 style={{ background: 'var(--bg-secondary)', color: 'var(--text-primary)', border: '1px solid var(--border-color)', borderRadius: '6px', padding: '0.25rem', fontSize: '0.75rem' }}
@@ -348,7 +350,9 @@ function FanChat({ sessionId, crowdData, currentLoc, setCurrentLoc }) {
                                 <option value="gate_d">Gate D (West)</option>
                             </select>
                         </div>
+                        <label htmlFor="chat-text-input" className="sr-only">Type a question</label>
                         <input
+                            id="chat-text-input"
                             type="text"
                             className="chat-input"
                             placeholder="Type a question in any language (e.g., 'mujhe section 102 jaana hai')..."
@@ -357,7 +361,7 @@ function FanChat({ sessionId, crowdData, currentLoc, setCurrentLoc }) {
                             onKeyDown={(e) => e.key === 'Enter' && handleSend()}
                             disabled={loading}
                         />
-                        <button className="send-btn" onClick={() => handleSend()} disabled={loading}>
+                        <button className="send-btn" onClick={() => handleSend()} disabled={loading} aria-label="Send message">
                             <Icon name="send" className="text-dark" size={18} />
                         </button>
                     </div>
@@ -673,7 +677,9 @@ function PasswordGate({ onAuthSuccess }) {
                 <div className="auth-title">Staff Dashboard</div>
                 <div className="auth-desc">Please enter the administration password to access real-time crowd metrics and user alerts.</div>
                 <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                    <label htmlFor="dashboard-password" className="sr-only">Administration password</label>
                     <input
+                        id="dashboard-password"
                         type="password"
                         className="auth-input"
                         placeholder="••••••••••••••"
@@ -752,20 +758,22 @@ function App() {
                 </div>
             </nav>
 
-            {page === 'fan' ? (
-                <FanChat 
-                    sessionId={sessionId} 
-                    crowdData={crowdData} 
-                    currentLoc={currentLoc}
-                    setCurrentLoc={setCurrentLoc}
-                />
-            ) : (
-                !authToken ? (
-                    <PasswordGate onAuthSuccess={(token) => setAuthToken(token)} />
+            <main>
+                {page === 'fan' ? (
+                    <FanChat 
+                        sessionId={sessionId} 
+                        crowdData={crowdData} 
+                        currentLoc={currentLoc}
+                        setCurrentLoc={setCurrentLoc}
+                    />
                 ) : (
-                    <StaffDashboard crowdData={crowdData} />
-                )
-            )}
+                    !authToken ? (
+                        <PasswordGate onAuthSuccess={(token) => setAuthToken(token)} />
+                    ) : (
+                        <StaffDashboard crowdData={crowdData} />
+                    )
+                )}
+            </main>
         </div>
     );
 }
