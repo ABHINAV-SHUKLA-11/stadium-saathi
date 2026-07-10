@@ -6,25 +6,53 @@ from google import genai
 from google.genai import types
 from app.core.config import settings
 
-# Define Pydantic schemas for Gemini structured outputs
+# ----------------------------------------------------------------------------
+# Pydantic schemas for Gemini structured outputs
+# ----------------------------------------------------------------------------
 
 class IntentExtraction(BaseModel):
+    """
+    Combined schema: extracts intent/entities AND (when possible) a ready-to-use
+    friendly response in a single Gemini call. This cuts the number of API
+    round-trips in half for non-navigation queries (greeting, general_info,
+    emergency, other), which make up the majority of fan messages.
+
+    For 'navigation' / 'facility_query' intents, `preliminary_response` is left
+    empty because the final response must incorporate the computed route and
+    crowd data, which are only known after this extraction step runs.
+    """
     detected_language: str = Field(description="ISO 639-1 language code or full language name of the fan's message")
     intent: str = Field(description="Intent category: 'navigation', 'facility_query', 'general_info', 'emergency', 'greeting', or 'other'")
     is_emergency: bool = Field(description="True if this is an emergency like medical distress, security issue, fire, or danger")
     start_location: Optional[str] = Field(None, description="Extracted starting location name or ID if mentioned in the query")
     end_location: Optional[str] = Field(None, description="Extracted destination location name, type, or ID if mentioned in the query")
     facility_type: Optional[str] = Field(None, description="If looking for a facility type, extract one of: 'gate', 'section', 'food_stall', 'washroom', 'first_aid', 'escalator', 'exit'")
+    preliminary_response: str = Field(
+        default="",
+        description=(
+            "If the intent is 'navigation' or 'facility_query', leave this EMPTY "
+            "(a follow-up call will generate the final response using computed route data). "
+            "For ALL OTHER intents (greeting, general_info, emergency, other), provide a "
+            "complete, friendly, ready-to-send response in the SAME language as the user's message."
+        )
+    )
+
 
 class FinalResponse(BaseModel):
     response: str = Field(description="A friendly, helpful response in the SAME language the fan used.")
     is_emergency: bool = Field(description="True if an emergency is detected")
 
+
+# Intents that require a second Gemini call because the response must
+# incorporate route/crowd data that is only available after pathfinding.
+_INTENTS_REQUIRING_CONTEXT_PASS = {"navigation", "facility_query"}
+
+
 class GeminiService:
     def __init__(self):
         self.api_key = settings.GEMINI_API_KEY
         self.client = None
-        
+
         # Check if API key is valid and not placeholder
         if self.api_key and "your_gemini_api_key" not in self.api_key.lower():
             try:
@@ -38,30 +66,46 @@ class GeminiService:
     def is_mock_mode(self) -> bool:
         return self.client is None
 
+    @staticmethod
+    def needs_context_pass(intent: str) -> bool:
+        """Whether this intent requires a second Gemini call with navigation/crowd context."""
+        return intent in _INTENTS_REQUIRING_CONTEXT_PASS
+
     async def extract_intent(self, message: str) -> IntentExtraction:
-        """Step 1: Extract intent, language, and location entities from user message"""
+        """
+        Single combined call: extracts intent/language/entities AND (for
+        non-navigation intents) a ready-to-use final response, in ONE
+        round-trip to Gemini instead of two.
+        """
         if self.is_mock_mode():
             return self._mock_extract_intent(message)
-            
+
         prompt = f"""
         Analyze this user message from a stadium visitor at a FIFA World Cup 2026 match.
         Extract the language, core intent, start/end locations, and any facility type being searched for.
-        
+
         Message: "{message}"
         """
-        
+
         try:
-            # We run in a threadpool if the SDK is blocking, or use standard call
             response = self.client.models.generate_content(
                 model="gemini-2.0-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=IntentExtraction,
-                    system_instruction="You are an expert multilingual classifier for stadium inquiries. Accurately categorize the user intent and extract locations. Be conservative with emergencies: only set is_emergency=true if there is a medical issue, security threat, fire, or immediate danger."
+                    system_instruction=(
+                        "You are 'Stadium Saathi', an expert multilingual assistant for stadium inquiries at "
+                        "FIFA World Cup 2026. Accurately categorize the user intent and extract locations. "
+                        "Be conservative with emergencies: only set is_emergency=true if there is a medical "
+                        "issue, security threat, fire, or immediate danger. "
+                        "If the intent is 'navigation' or 'facility_query', leave preliminary_response empty. "
+                        "For every other intent, write a warm, concise, ready-to-send preliminary_response "
+                        "in the SAME language as the user's message."
+                    )
                 )
             )
-            
+
             data = json.loads(response.text)
             return IntentExtraction(**data)
         except Exception as e:
@@ -76,7 +120,10 @@ class GeminiService:
         navigation_context: Optional[str] = None,
         crowd_alert: Optional[str] = None
     ) -> str:
-        """Step 2: Generate the final friendly response in the user's language using context"""
+        """
+        Second-pass call, used ONLY for navigation/facility_query intents where
+        the response must incorporate computed route + crowd data.
+        """
         if self.is_mock_mode():
             return self._mock_generate_response(message, detected_language, intent, navigation_context, crowd_alert)
 
@@ -114,10 +161,14 @@ class GeminiService:
             print(f"Gemini generate_response error: {e}. Falling back to mock response.")
             return self._mock_generate_response(message, detected_language, intent, navigation_context, crowd_alert)
 
+    # ------------------------------------------------------------------------
+    # Mock mode (used when no API key is configured, e.g. local dev/testing)
+    # ------------------------------------------------------------------------
+
     def _mock_extract_intent(self, message: str) -> IntentExtraction:
         """Mock implementation of intent extraction for offline testing"""
         msg = message.lower()
-        
+
         # Simple rule-based detector
         detected_lang = "English"
         if any(w in msg for w in ["hola", "como", "dónde", "baño", "puerta"]):
@@ -132,7 +183,7 @@ class GeminiService:
             detected_lang = "Portuguese"
 
         is_emergency = any(w in msg for w in ["hurt", "help", "pain", "medical", "doctor", "police", "fight", "fire", "emergency", "accident", "bleeding", "choking"])
-        
+
         intent = "general_info"
         facility_type = None
         end_location = None
@@ -142,7 +193,6 @@ class GeminiService:
         elif any(w in msg for w in ["food", "eat", "stall", "burger", "pizza", "curry", "taco", "cafe"]):
             intent = "facility_query"
             facility_type = "food_stall"
-            # Try to match specific food name
             for food in ["burger", "taco", "curry", "cafe", "pizza", "halal"]:
                 if food in msg:
                     end_location = food
@@ -160,15 +210,13 @@ class GeminiService:
                 facility_type = "gate"
             elif "escalator" in msg:
                 facility_type = "escalator"
-            
-            # Simple extraction of numbers
+
             for word in msg.split():
                 if word.isdigit() or (word.startswith("gate_") or word.startswith("section_")):
                     end_location = word
         elif any(w in msg for w in ["hello", "hi", "hey", "hola", "namaste", "marhaba", "bonjour"]):
             intent = "greeting"
 
-        # Check if start location mentioned
         start_location = None
         if "from" in msg:
             parts = msg.split("from")
@@ -177,13 +225,22 @@ class GeminiService:
                 if words:
                     start_location = words[0]
 
+        preliminary_response = ""
+        if intent not in _INTENTS_REQUIRING_CONTEXT_PASS:
+            preliminary_response = self._mock_generate_response(
+                message=message,
+                detected_language=detected_lang,
+                intent=intent
+            )
+
         return IntentExtraction(
             detected_language=detected_lang,
             intent=intent,
             is_emergency=is_emergency,
             start_location=start_location,
             end_location=end_location,
-            facility_type=facility_type
+            facility_type=facility_type,
+            preliminary_response=preliminary_response
         )
 
     def _mock_generate_response(
@@ -196,8 +253,7 @@ class GeminiService:
     ) -> str:
         """Mock implementation of response generation for offline testing"""
         lang = detected_language.lower()
-        
-        # Responses by language
+
         responses = {
             "english": {
                 "greeting": "Hello! Welcome to the stadium. How can I help you today?",
@@ -243,7 +299,6 @@ class GeminiService:
             }
         }
 
-        # Fallback to English if language not supported
         lang_key = "english"
         for k in responses.keys():
             if k in lang:
@@ -267,5 +322,6 @@ class GeminiService:
             return resp
         else:
             return r["general"]
+
 
 gemini_service = GeminiService()
