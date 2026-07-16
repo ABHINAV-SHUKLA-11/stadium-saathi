@@ -1,78 +1,96 @@
-from fastapi import APIRouter
-from fastapi.responses import StreamingResponse
-from app.services.crowd_service import crowd_service
-import json
 import asyncio
+import random
 import logging
-
-logger = logging.getLogger(__name__)
-
-router = APIRouter()
-
-
-def _format_densities(densities: dict) -> list:
-    """Convert raw density dict into formatted list with status labels."""
-    formatted = []
-    for zone, density in densities.items():
-        if density > 90:
-            status = "Critical"
-        elif density > 75:
-            status = "High"
-        elif density > 40:
-            status = "Medium"
-        else:
-            status = "Low"
-
-        formatted.append({
-            "zone": zone,
-            "density": density,
-            "status": status,
-        })
-    return formatted
-
-
-@router.get("")
-async def get_crowd_densities():
-    """Get current snapshot of crowd densities for all zones."""
-    densities = crowd_service.get_current_densities()
-    return _format_densities(densities)
-
-
-@router.get("/stream")
-async def stream_crowd_densities():
-    """SSE endpoint for streaming real-time crowd updates to the dashboard."""
-
-    async def event_generator():
-        queue = await crowd_service.register_listener()
-        last_sent = None  # ✅ IMPROVEMENT: Track last sent data
-
-        try:
-            while True:
-                try:
-                    # ✅ IMPROVEMENT: Timeout after 30s and send heartbeat
-                    # so Nginx / load-balancers don't close the connection
-                    data = await asyncio.wait_for(queue.get(), timeout=30.0)
-
-                    # ✅ IMPROVEMENT: Only push if data has actually changed
-                    if data != last_sent:
-                        last_sent = data
-                        formatted = _format_densities(data)
-                        yield f"data: {json.dumps(formatted)}\n\n"
-
-                except asyncio.TimeoutError:
-                    # Send a keepalive comment so the connection stays open
-                    yield ": keepalive\n\n"
-
-        except asyncio.CancelledError:
-            logger.info("SSE client disconnected — cleaning up listener.")
-        finally:
-            crowd_service.unregister_listener(queue)
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",   # Disable Nginx buffering for SSE
-        }
-    )
+from datetime import datetime
+from typing import Dict, List
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.database import async_session_factory
+from app.models.models import CrowdDensity
+# Configure logging
+logger = logging.getLogger("crowd_service")
+# Fictional Stadium Zones
+ZONES = [
+    "North", "South", "East", "West", 
+    "North-East", "South-West", "North-West", "South-East", 
+    "Center"
+]
+class CrowdService:
+    def __init__(self):
+        # Initialize baseline densities between 20% and 60%
+        self.current_densities: Dict[str, int] = {zone: random.randint(20, 60) for zone in ZONES}
+        self.listeners: List[asyncio.Queue] = []
+        self.is_running = False
+        self._simulation_task = None
+    def get_current_densities(self) -> Dict[str, int]:
+        return self.current_densities
+    async def register_listener(self) -> asyncio.Queue:
+        """Register a new listener queue for SSE updates"""
+        queue = asyncio.Queue()
+        self.listeners.append(queue)
+        # Immediately push current state to the new listener
+        await queue.put(self.current_densities)
+        return queue
+    def unregister_listener(self, queue: asyncio.Queue):
+        if queue in self.listeners:
+            self.listeners.remove(queue)
+    async def start_simulation(self):
+        self.is_running = True
+        self._simulation_task = asyncio.create_task(self._run_simulation())
+        logger.info("Crowd Simulation Service started.")
+    async def stop_simulation(self):
+        self.is_running = False
+        if self._simulation_task:
+            self._simulation_task.cancel()
+            try:
+                await self._simulation_task
+            except asyncio.CancelledError:
+                pass
+        logger.info("Crowd Simulation Service stopped.")
+    async def _run_simulation(self):
+        while self.is_running:
+            try:
+                # Update densities using random walk (clamped between 10% and 98%)
+                for zone in ZONES:
+                    current = self.current_densities[zone]
+                    # Random change between -15 and +15
+                    change = random.randint(-15, 15)
+                    
+                    # Periodic spikes (10% chance) to simulate rush hours / mass movement
+                    if random.random() < 0.1:
+                        change = random.choice([30, -30])
+                        
+                    new_density = max(10, min(98, current + change))
+                    self.current_densities[zone] = new_density
+                # Save snapshot to database
+                await self._save_snapshot_to_db()
+                # Notify all SSE listeners
+                # We duplicate list to avoid modification during iteration
+                active_listeners = list(self.listeners)
+                for queue in active_listeners:
+                    try:
+                        await queue.put(self.current_densities)
+                    except Exception as e:
+                        # Listener queue might be closed/full
+                        self.listeners.remove(queue)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in crowd simulation loop: {e}")
+                
+            # Run every 8-12 seconds
+            await asyncio.sleep(random.uniform(8.0, 12.0))
+    async def _save_snapshot_to_db(self):
+        """Save the current crowd density snapshot to SQLite database"""
+        async with async_session_factory() as session:
+            try:
+                for zone, density in self.current_densities.items():
+                    log_entry = CrowdDensity(
+                        zone_id=zone,
+                        density=density
+                    )
+                    session.add(log_entry)
+                await session.commit()
+            except Exception as e:
+                logger.error(f"Failed to save crowd snapshot to DB: {e}")
+                await session.rollback()
+crowd_service = CrowdService()
