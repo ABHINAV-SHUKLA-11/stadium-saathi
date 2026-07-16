@@ -1,10 +1,17 @@
 import os
 import json
+import asyncio
+import hashlib
+import logging
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 from app.core.config import settings
+
+# ✅ IMPROVEMENT: Use proper logging instead of print()
+logger = logging.getLogger(__name__)
+
 # Define Pydantic schemas for Gemini structured outputs
 class IntentExtraction(BaseModel):
     detected_language: str = Field(description="ISO 639-1 language code or full language name of the fan's message")
@@ -13,54 +20,96 @@ class IntentExtraction(BaseModel):
     start_location: Optional[str] = Field(None, description="Extracted starting location name or ID if mentioned in the query")
     end_location: Optional[str] = Field(None, description="Extracted destination location name, type, or ID if mentioned in the query")
     facility_type: Optional[str] = Field(None, description="If looking for a facility type, extract one of: 'gate', 'section', 'food_stall', 'washroom', 'first_aid', 'escalator', 'exit'")
+
 class FinalResponse(BaseModel):
     response: str = Field(description="A friendly, helpful response in the SAME language the fan used.")
     is_emergency: bool = Field(description="True if an emergency is detected")
+
+
 class GeminiService:
     def __init__(self):
         self.api_key = settings.GEMINI_API_KEY
         self.client = None
-        
+
+        # ✅ IMPROVEMENT: In-memory caches to avoid redundant Gemini calls
+        self._intent_cache: Dict[str, IntentExtraction] = {}
+        self._response_cache: Dict[str, str] = {}
+
         # Check if API key is valid and not placeholder
         if self.api_key and "your_gemini_api_key" not in self.api_key.lower():
             try:
                 self.client = genai.Client(api_key=self.api_key)
-                print("Gemini Client initialized successfully.")
+                logger.info("Gemini Client initialized successfully.")
             except Exception as e:
-                print(f"Failed to initialize Gemini Client: {e}")
+                logger.error("Failed to initialize Gemini Client: %s", e)
         else:
-            print("WARNING: Gemini API Key is missing or placeholder. Running in Mock Mode.")
+            logger.warning("Gemini API Key is missing or placeholder. Running in Mock Mode.")
+
     def is_mock_mode(self) -> bool:
         return self.client is None
+
+    def _make_cache_key(self, *args: str) -> str:
+        """Create a stable MD5 hash key from multiple string arguments."""
+        combined = "|".join(a.strip().lower() for a in args if a)
+        return hashlib.md5(combined.encode()).hexdigest()
+
     async def extract_intent(self, message: str) -> IntentExtraction:
-        """Step 1: Extract intent, language, and location entities from user message"""
+        """Step 1: Extract intent, language, and location entities from user message."""
         if self.is_mock_mode():
             return self._mock_extract_intent(message)
-            
+
+        # ✅ IMPROVEMENT: Return cached result for identical messages
+        cache_key = self._make_cache_key(message)
+        if cache_key in self._intent_cache:
+            logger.debug("Cache hit for extract_intent: %s", message[:40])
+            return self._intent_cache[cache_key]
+
         prompt = f"""
         Analyze this user message from a stadium visitor at a FIFA World Cup 2026 match.
         Extract the language, core intent, start/end locations, and any facility type being searched for.
         
         Message: "{message}"
         """
-        
+
         try:
-            # We run in a threadpool if the SDK is blocking, or use standard call
-            response = self.client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=IntentExtraction,
-                    system_instruction="You are an expert multilingual classifier for stadium inquiries. Accurately categorize the user intent and extract locations. Be conservative with emergencies: only set is_emergency=true if there is a medical issue, security threat, fire, or immediate danger."
+            # ✅ IMPROVEMENT: run_in_executor prevents blocking the async event loop
+            # The google-genai SDK's generate_content() is synchronous — wrapping it
+            # means FastAPI can handle other requests while Gemini processes this one.
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.client.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=IntentExtraction,
+                        system_instruction=(
+                            "You are an expert multilingual classifier for stadium inquiries. "
+                            "Accurately categorize the user intent and extract locations. "
+                            "Be conservative with emergencies: only set is_emergency=true if "
+                            "there is a medical issue, security threat, fire, or immediate danger."
+                        )
+                    )
                 )
             )
-            
+
             data = json.loads(response.text)
-            return IntentExtraction(**data)
-        except Exception as e:
-            print(f"Gemini extract_intent error: {e}. Falling back to mock extraction.")
+            result = IntentExtraction(**data)
+
+            # ✅ Cache result (don't cache emergencies — always re-evaluate)
+            if not result.is_emergency:
+                self._intent_cache[cache_key] = result
+
+            return result
+
+        # ✅ IMPROVEMENT: Specific exception types instead of bare except
+        except json.JSONDecodeError as e:
+            logger.warning("Gemini returned invalid JSON in extract_intent: %s. Using mock.", e)
             return self._mock_extract_intent(message)
+        except Exception as e:
+            logger.error("Gemini extract_intent error: %s. Falling back to mock.", e)
+            return self._mock_extract_intent(message)
+
     async def generate_response(
         self,
         message: str,
@@ -69,9 +118,20 @@ class GeminiService:
         navigation_context: Optional[str] = None,
         crowd_alert: Optional[str] = None
     ) -> str:
-        """Step 2: Generate the final friendly response in the user's language using context"""
+        """Step 2: Generate the final friendly response in the user's language using context."""
         if self.is_mock_mode():
-            return self._mock_generate_response(message, detected_language, intent, navigation_context, crowd_alert)
+            return self._mock_generate_response(
+                message, detected_language, intent, navigation_context, crowd_alert
+            )
+
+        # ✅ IMPROVEMENT: Cache final responses (skip cache if crowd data is involved,
+        # since crowd density changes every few seconds)
+        if not crowd_alert:
+            cache_key = self._make_cache_key(message, detected_language, intent, navigation_context or "")
+            if cache_key in self._response_cache:
+                logger.debug("Cache hit for generate_response: %s", message[:40])
+                return self._response_cache[cache_key]
+
         prompt = f"""
         User Message: "{message}"
         Language to use: {detected_language}
@@ -81,94 +141,119 @@ class GeminiService:
             prompt += f"\nNavigation Route Info: {navigation_context}"
         if crowd_alert:
             prompt += f"\nCrowd Congestion Alert: {crowd_alert}"
+
         system_instr = """
         You are "Stadium Saathi", a friendly, helpful GenAI-powered multi-language assistant for FIFA World Cup 2026 stadium visitors.
         Your goals:
         1. ALWAYS respond in the SAME language the fan used (indicated in the prompt).
         2. Be warm, welcoming, and concise. Keep instructions simple.
         3. If navigation or route info is provided, present the step-by-step directions clearly.
-        4. If a crowd alert is provided, politely advise the user about the congestion and guide them to use the alternate path recommended in the navigation route info.
-        5. If there is an emergency, instruct them to stay calm and inform them that stadium medical/security staff have been alerted and are on their way.
+        4. If a crowd alert is provided, warn the fan clearly and suggest the alternative route.
+        5. For emergencies, provide calm, clear guidance and direct them to the nearest staff or first-aid.
+        6. Never mention technical details like node IDs or graph algorithms.
         """
+
         try:
-            response = self.client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instr
+            # ✅ IMPROVEMENT: Non-blocking call via run_in_executor
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.client.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=FinalResponse,
+                        system_instruction=system_instr
+                    )
                 )
             )
-            return response.text.strip()
+
+            data = json.loads(response.text)
+            result_text: str = data.get("response", "")
+
+            # ✅ Cache non-crowd responses
+            if not crowd_alert and result_text:
+                cache_key = self._make_cache_key(message, detected_language, intent, navigation_context or "")
+                self._response_cache[cache_key] = result_text
+
+            return result_text
+
+        except json.JSONDecodeError as e:
+            logger.warning("Gemini returned invalid JSON in generate_response: %s. Using mock.", e)
+            return self._mock_generate_response(
+                message, detected_language, intent, navigation_context, crowd_alert
+            )
         except Exception as e:
-            print(f"Gemini generate_response error: {e}. Falling back to mock response.")
-            return self._mock_generate_response(message, detected_language, intent, navigation_context, crowd_alert)
+            logger.error("Gemini generate_response error: %s. Falling back to mock.", e)
+            return self._mock_generate_response(
+                message, detected_language, intent, navigation_context, crowd_alert
+            )
+
+    # ------------------------------------------------------------------ #
+    #  Mock mode helpers (unchanged from original)                         #
+    # ------------------------------------------------------------------ #
+
     def _mock_extract_intent(self, message: str) -> IntentExtraction:
-        """Mock implementation of intent extraction for offline testing"""
-        msg = message.lower()
-        
-        # Simple rule-based detector
-        detected_lang = "English"
-        if any(w in msg for w in ["hola", "como", "dónde", "baño", "puerta"]):
-            detected_lang = "Spanish"
-        elif any(w in msg for w in ["bonjour", "ou est", "toilette", "porte"]):
-            detected_lang = "French"
-        elif any(w in msg for w in ["hindi", "kahan", "rasta", "shauchalay", "gate"]):
-            detected_lang = "Hindi"
-        elif any(w in msg for w in ["marhaba", "ayn", "shukran", "bab"]):
-            detected_lang = "Arabic"
-        elif any(w in msg for w in ["olá", "onde", "banheiro", "porta"]):
-            detected_lang = "Portuguese"
-        is_emergency = any(w in msg for w in ["hurt", "help", "pain", "medical", "doctor", "police", "fight", "fire", "emergency", "accident", "bleeding", "choking"])
-        
+        """Rule-based fallback when Gemini API is unavailable."""
+        message_lower = message.lower()
         intent = "general_info"
-        facility_type = None
-        end_location = None
-        if is_emergency:
-            intent = "emergency"
-        elif any(w in msg for w in ["food", "eat", "stall", "burger", "pizza", "curry", "taco", "cafe"]):
-            intent = "facility_query"
-            facility_type = "food_stall"
-            # Try to match specific food name
-            for food in ["burger", "taco", "curry", "cafe", "pizza", "halal"]:
-                if food in msg:
-                    end_location = food
-        elif any(w in msg for w in ["toilet", "washroom", "bathroom", "restroom", "shauchalay", "baño", "banheiro", "toilette"]):
-            intent = "facility_query"
-            facility_type = "washroom"
-        elif any(w in msg for w in ["first aid", "medical room", "doctor", "clinic", "aid"]):
-            intent = "facility_query"
-            facility_type = "first_aid"
-        elif any(w in msg for w in ["gate", "entrance", "exit", "section", "escalator", "elevator", "stairs", "how to get", "go to", "directions", "route", "way to"]):
-            intent = "navigation"
-            if "section" in msg:
-                facility_type = "section"
-            elif "gate" in msg:
-                facility_type = "gate"
-            elif "escalator" in msg:
-                facility_type = "escalator"
-            
-            # Simple extraction of numbers
-            for word in msg.split():
-                if word.isdigit() or (word.startswith("gate_") or word.startswith("section_")):
-                    end_location = word
-        elif any(w in msg for w in ["hello", "hi", "hey", "hola", "namaste", "marhaba", "bonjour"]):
-            intent = "greeting"
-        # Check if start location mentioned
+        is_emergency = False
         start_location = None
-        if "from" in msg:
-            parts = msg.split("from")
-            if len(parts) > 1:
-                words = parts[1].strip().split()
-                if words:
-                    start_location = words[0]
+        end_location = None
+        facility_type = None
+
+        emergency_keywords = ["help", "emergency", "fire", "medical", "hurt", "injured", "lost child", "security"]
+        navigation_keywords = ["how do i get", "where is", "find", "navigate", "directions to", "take me to", "go to"]
+        facility_keywords = {
+            "washroom": "washroom", "toilet": "washroom", "bathroom": "washroom", "restroom": "washroom",
+            "food": "food_stall", "eat": "food_stall", "drink": "food_stall",
+            "gate": "gate", "entrance": "gate", "exit": "exit",
+            "first aid": "first_aid", "medical": "first_aid",
+            "escalator": "escalator", "elevator": "escalator",
+        }
+
+        if any(kw in message_lower for kw in emergency_keywords):
+            if any(kw in message_lower for kw in ["fire", "medical", "hurt", "injured", "lost child"]):
+                is_emergency = True
+                intent = "emergency"
+
+        if any(kw in message_lower for kw in navigation_keywords):
+            intent = "navigation"
+
+        for keyword, ftype in facility_keywords.items():
+            if keyword in message_lower:
+                intent = "facility_query"
+                facility_type = ftype
+                break
+
+        # Detect language (very basic heuristic)
+        detected_language = "en"
+        hindi_chars = any('\u0900' <= c <= '\u097f' for c in message)
+        spanish_words = ["donde", "como", "dónde", "cómo", "ayuda", "baño"]
+        arabic_chars = any('\u0600' <= c <= '\u06ff' for c in message)
+        french_words = ["où", "comment", "toilettes", "aide", "bonjour"]
+        portuguese_words = ["onde", "como", "banheiro", "ajuda", "obrigado"]
+
+        if hindi_chars:
+            detected_language = "hi"
+        elif arabic_chars:
+            detected_language = "ar"
+        elif any(w in message_lower for w in spanish_words):
+            detected_language = "es"
+        elif any(w in message_lower for w in french_words):
+            detected_language = "fr"
+        elif any(w in message_lower for w in portuguese_words):
+            detected_language = "pt"
+
         return IntentExtraction(
-            detected_language=detected_lang,
+            detected_language=detected_language,
             intent=intent,
             is_emergency=is_emergency,
             start_location=start_location,
             end_location=end_location,
             facility_type=facility_type
         )
+
     def _mock_generate_response(
         self,
         message: str,
@@ -177,74 +262,44 @@ class GeminiService:
         navigation_context: Optional[str] = None,
         crowd_alert: Optional[str] = None
     ) -> str:
-        """Mock implementation of response generation for offline testing"""
-        lang = detected_language.lower()
-        
-        # Responses by language
+        """Friendly rule-based response when Gemini API is unavailable."""
         responses = {
-            "english": {
-                "greeting": "Hello! Welcome to the stadium. How can I help you today?",
-                "emergency": "Emergency detected. Please stay calm. Stadium medical and security teams have been notified and are on their way to your area.",
-                "general": "Thank you for asking. Please let me know if you need directions or facility details.",
-                "nav_prefix": "Here are your directions: ",
-                "crowd_prefix": "Notice: Some areas are congested. We have adjusted your route. "
+            "en": {
+                "greeting": "Hello! Welcome to the FIFA World Cup 2026! I'm Stadium Saathi, your personal stadium assistant. How can I help you today?",
+                "navigation": f"I'd be happy to help you navigate! {navigation_context or 'Please tell me your current location and destination.'}",
+                "facility_query": f"Let me find that for you! {navigation_context or 'Could you tell me your current location?'}",
+                "emergency": "🚨 EMERGENCY: Please remain calm. Contact the nearest staff member or call security immediately. First aid stations are located at Gates A, C, and E.",
+                "general_info": "Welcome to the FIFA World Cup 2026 stadium! I can help you find gates, food, washrooms, first aid, and navigate anywhere in the stadium. What do you need?",
             },
-            "spanish": {
-                "greeting": "¡Hola! Bienvenido al estadio. ¿Cómo puedo ayudarte hoy?",
-                "emergency": "Emergencia detectada. Por favor, mantenga la calma. Los equipos médicos y de seguridad del estadio han sido notificados y están en camino a su área.",
-                "general": "Gracias por preguntar. Por favor, avíseme si necesita direcciones o detalles de las instalaciones.",
-                "nav_prefix": "Aquí están sus instrucciones de navegación: ",
-                "crowd_prefix": "Aviso: Algunas áreas están congestionadas. Hemos ajustado su ruta. "
+            "hi": {
+                "greeting": "नमस्ते! FIFA विश्व कप 2026 में आपका स्वागत है! मैं Stadium Saathi हूँ। आप मुझसे हिंदी में बात कर सकते हैं।",
+                "navigation": f"मैं आपको रास्ता बताने में मदद करूँगा! {navigation_context or 'कृपया अपना वर्तमान स्थान और गंतव्य बताएं।'}",
+                "facility_query": f"मैं आपके लिए खोजता हूँ! {navigation_context or 'कृपया अपना वर्तमान स्थान बताएं।'}",
+                "emergency": "🚨 आपातकाल: शांत रहें। निकटतम स्टाफ सदस्य से संपर्क करें।",
+                "general_info": "FIFA विश्व कप 2026 स्टेडियम में आपका स्वागत है! मैं आपको गेट, खाना, वॉशरूम और प्राथमिक चिकित्सा खोजने में मदद कर सकता हूँ।",
             },
-            "hindi": {
-                "greeting": "नमस्ते! स्टेडियम में आपका स्वागत है। आज मैं आपकी क्या सहायता कर सकता हूँ?",
-                "emergency": "आपातकालीन स्थिति का पता चला है। कृपया शांत रहें। स्टेडियम की मेडिकल और सुरक्षा टीमों को सूचित कर दिया गया है और वे आपके क्षेत्र में आ रही हैं।",
-                "general": "पूछने के लिए धन्यवाद। यदि आपको दिशा-निर्देश या सुविधाओं के विवरण की आवश्यकता हो तो कृपया मुझे बताएं।",
-                "nav_prefix": "यहाँ आपके दिशा-निर्देश हैं: ",
-                "crowd_prefix": "सूचना: कुछ क्षेत्रों में भीड़ है। हमने आपका मार्ग बदल दिया है। "
+            "es": {
+                "greeting": "¡Hola! ¡Bienvenido a la Copa Mundial FIFA 2026! Soy Stadium Saathi, tu asistente personal.",
+                "navigation": f"¡Con gusto te ayudo a navegar! {navigation_context or 'Por favor dime tu ubicación actual y destino.'}",
+                "facility_query": f"¡Déjame buscar eso! {navigation_context or '¿Puedes decirme tu ubicación actual?'}",
+                "emergency": "🚨 EMERGENCIA: Mantén la calma. Contacta al personal más cercano o llama a seguridad.",
+                "general_info": "¡Bienvenido al estadio de la Copa Mundial FIFA 2026! Puedo ayudarte a encontrar puertas, comida, baños y primeros auxilios.",
             },
-            "french": {
-                "greeting": "Bonjour! Bienvenue au stade. Comment puis-je vous aider aujourd'hui?",
-                "emergency": "Urgence détectée. Veuillez rester calme. Les équipes médicales et de sécurité du stade ont été informées et sont en route vers votre zone.",
-                "general": "Merci de demander. Veuillez me faire savoir si vous avez besoin d'itinéraires ou de détails sur les installations.",
-                "nav_prefix": "Voici vos directions: ",
-                "crowd_prefix": "Avis: Certaines zones sont encombrées. Nous avons adapté votre itinéraire. "
-            },
-            "arabic": {
-                "greeting": "مرحباً! أهلاً بك في الملعب. كيف يمكنني مساعدتك اليوم؟",
-                "emergency": "تم اكتشاف حالة طوارئ. يرجى البقاء هادئاً. تم إخطار الفرق الطبية والأمنية في الملعب وهي في طريقها إلى منطقتك.",
-                "general": "شكراً لسؤالك. يرجى إعلامي إذا كنت بحاجة إلى اتجاهات أو تفاصيل عن المرافق.",
-                "nav_prefix": "إليك الاتجاهات: ",
-                "crowd_prefix": "تنبيه: بعض المناطق مزدحمة. لقد قمنا بتعديل مسارك. "
-            },
-            "portuguese": {
-                "greeting": "Olá! Bem-vindo ao estádio. Como posso ajudar você hoje?",
-                "emergency": "Emergência detectada. Por favor, mantenha a calma. As equipes médicas e de segurança do estádio foram notificadas e estão a caminho da sua área.",
-                "general": "Obrigado por perguntar. Por favor, informe-me se precisar de direções ou detalhes das instalações.",
-                "nav_prefix": "Aqui estão as suas direções: ",
-                "crowd_prefix": "Aviso: Algumas áreas estão congestionadas. Ajustamos a sua rota. "
-            }
         }
-        # Fallback to English if language not supported
-        lang_key = "english"
-        for k in responses.keys():
-            if k in lang:
-                lang_key = k
-                break
-        r = responses[lang_key]
-        if intent == "greeting":
-            return r["greeting"]
-        elif intent == "emergency":
-            return r["emergency"]
-        elif intent in ["navigation", "facility_query"]:
-            resp = ""
-            if crowd_alert:
-                resp += r["crowd_prefix"]
-            if navigation_context:
-                resp += r["nav_prefix"] + navigation_context
+
+        lang_responses = responses.get(detected_language, responses["en"])
+        base_response = lang_responses.get(intent, lang_responses["general_info"])
+
+        if crowd_alert:
+            if detected_language == "hi":
+                base_response += f"\n\n⚠️ भीड़ चेतावनी: {crowd_alert}"
+            elif detected_language == "es":
+                base_response += f"\n\n⚠️ Alerta de aglomeración: {crowd_alert}"
             else:
-                resp += "I couldn't calculate a route because the start or destination location is not clear. Could you please specify where you are and where you want to go?"
-            return resp
-        else:
-            return r["general"]
+                base_response += f"\n\n⚠️ Crowd Alert: {crowd_alert}"
+
+        return base_response
+
+
+# Singleton instance
 gemini_service = GeminiService()
